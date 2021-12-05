@@ -1,0 +1,572 @@
+---
+title: "ML_Capstone_Ben"
+author: "Benarivo"
+date: "28/03/2020"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(forecast)
+library(purrr)
+library(yardstick)
+library(lubridate)
+library(recipes)
+library(magrittr)
+library(plotly)
+library(MLmetrics)
+```
+
+# 1. Data Preprocess
+Firstly, we will need to load the data and explore it. 
+```{r}
+scotty <- read.csv("data/data-train.csv")
+```
+
+```{r}
+head(scotty)
+```
+
+Based on above exploration, 'start_time' should be changed from factor to date.
+
+```{r}
+scotty$start_time <- ymd_hms(scotty$start_time)
+```
+
+```{r}
+head(scotty)
+```
+
+Then, we need to floor the 'start_time' to hours and save it as 'datetime'.
+
+```{r}
+scotty <- scotty %>% 
+   mutate(datetime = floor_date(start_time, unit ="hour"))
+
+tail(scotty)
+```
+
+Because we need to analyse the data hourly demand per area 'src_sub_area', the data should be groupped by 'src_sub_area' and 'datetime'
+
+```{r}
+scotty <- scotty %>% 
+   group_by(src_sub_area,datetime) %>% 
+   summarise(demand = n()) #n or n_distinct
+
+head(scotty)
+```
+Based of above exploration, there are times when there is no demand, for example at 2017-10-01 on 07:00:00.
+Therefore, we need to do time series padding, to set the demand to zero when there is no demand. 
+
+
+Firstly, we set the interval of the time series padding, which is the same interval of our full data. 
+```{r}
+min_date <- min(scotty$datetime)
+max_date <- max(scotty$datetime)
+inpad <- interval(min_date,max_date)
+inpad
+```
+
+The time series padding interval is from 2017-10-01 00:00:00 until 2017-12-02 23:00:00.
+Then, the data is padded using the interval.
+```{r}
+scotty <- scotty %>% 
+   padr::pad(start_val=min_date, end_val=max_date)
+
+head(scotty)
+```
+As seen above, we already have the 'datetime' data for when there is no demand. 
+However, the data is still NA, this is proven as shown below that there is an NA data.
+
+```{r}
+anyNA(scotty)
+```
+
+Now, we need to replace the NA to zero. 
+```{r}
+scotty <- scotty %>% 
+   mutate(demand = replace_na(demand,0))
+
+anyNA(scotty)
+```
+
+```{r}
+head(scotty)
+```
+
+The data is now duplicated into two for two different pre-processing method: square root transformation and log transformation 
+```{r}
+scotty_sqrtscale <- scotty
+scotty_log <- scotty
+```
+
+Because, it is not possible to have log of 0, we transform zero to the nearest value of zero. In this case, 0.1 is used.
+```{r}
+scotty_log <- scotty_log %>% 
+   mutate(demand = replace(demand, demand == 0, 0.1))
+
+head(scotty_log)
+```
+
+
+# 2.Cross-Validation Scheme
+
+Before, we do the square root transformation and log transformation preprocessing, we will explore on how the data will be cross-validated.
+
+
+First we need to determine the interval of the train and validation dataset. 
+This is a simpler version of the rolling origin method, in which the validation test are taken from the most recent data. 
+Data for 15 days will be used for validation dataset, this is approximately around 25% of the total data. 
+
+```{r}
+# train-val-test size
+val_size <- 24 * 15 # 15 from 62 days 
+
+# get the min-max of the time index for each sample
+val_end <- max(scotty$datetime)
+val_start <- val_end - hours(val_size) + hours(1)
+
+train_end <- val_start - hours(1)
+train_start <- min_date
+
+intrain <- interval(train_start, train_end)
+inval <- interval(val_start, val_end)
+
+intrain
+inval
+```
+The interval of training dataset is: 2017-10-01 00:00:00 - 2017-11-17 23:00:00.
+The interval of validation dataset is: 2017-11-18 00:00:00 - 2017-12-02 23:00:00.
+
+We will now visualize the data, with the red colored lines representing the validation dataset. 
+```{r}
+scotty %>%
+  mutate(sample = case_when(
+    datetime %within% intrain ~ "train",
+    datetime %within% inval ~ "validation"
+  )) %>%
+  mutate(sample = factor(sample, levels = c("train", "validation"))) %>%
+  ggplot(aes(x = datetime, y = demand, colour = sample)) +
+    geom_line() +
+    labs(x = NULL, y = NULL, colour = NULL) +
+    facet_wrap(~ src_sub_area, scale = "free", ncol = 1) +
+    tidyquant::theme_tq() +
+    tidyquant::scale_colour_tq()
+```
+
+# 3. Data Preprocess: Square Root Transformation
+
+The first preprocessing is the square root transformation. 
+
+First, we spread the data using 'spread()' function.
+```{r}
+scotty_sqrtscale %<>%
+  spread(src_sub_area, demand)
+
+tail(scotty_sqrtscale)
+```
+
+Then, using 'recipe', the data is preprocessed using: square root transformation and additionaly center and scale transformation.
+```{r}
+# recipes: square root, center, scale
+rec <- recipe(~ ., filter(scotty_sqrtscale, datetime %within% intrain)) %>% #filter(scotty_sqrtscale, datetime %within% intrain) does not needed
+  step_sqrt(all_numeric()) %>%
+  step_center(all_numeric()) %>%
+  step_scale(all_numeric()) %>%
+  prep()
+
+# preview the bake results
+scotty_sqrtscale <- bake(rec, scotty_sqrtscale) 
+tail(scotty_sqrtscale)
+```
+
+Then, before moving on, we make a function to reverse back the processing 'rec_revert_sqrtscale'. This is will be useful, we we are analysing the result.
+```{r}
+# revert back function
+rec_revert_sqrtscale <- function(vector, rec, varname) {
+
+  # store recipe values
+  rec_center <- rec$steps[[2]]$means[varname]
+  rec_scale <- rec$steps[[3]]$sds[varname]
+
+  # convert back based on the recipe
+  results <- (vector * rec_scale + rec_center) ^ 2
+
+  # add additional adjustment if necessary
+  results <- round(results)
+
+  # return the results
+  results
+
+}
+```
+
+Finally, we changed the dataframe into a long format. 
+```{r}
+scotty_sqrtscale %<>%
+  gather(src_sub_area, demand, -datetime)
+  
+head(scotty_sqrtscale)
+```
+
+# 4. Data Preprocess: Log Transformation
+
+The second preprocessing is the log transformation.
+
+```{r}
+head(scotty_log)
+```
+
+The process is very simple, we only need to do the log transformation of the 'demand'.
+```{r}
+scotty_log$demand <- log(scotty_log$demand)
+
+head(scotty_log)
+```
+
+# 5.Cross-validating both transformed data
+
+Now we need to cross-validated both transformed data, and create a nested dataframe to be able to build automated model selection.
+
+First, for the square root scale transformation. 
+```{r}
+scotty_sqrtscale %<>%
+  mutate(set = case_when(
+    datetime %within% intrain ~ "train",
+    datetime %within% inval ~ "validation"
+  )) 
+
+head(scotty_sqrtscale)
+```
+
+```{r}
+scotty_sqrtscale %<>%
+  group_by(src_sub_area, set) %>% 
+   nest(.key = "data") %>% 
+   pivot_wider(names_from = set, values_from = data)
+
+scotty_sqrtscale
+```
+
+
+Secondly, for the log transformed data.
+```{r}
+scotty_log %<>%
+  mutate(set = case_when(
+    datetime %within% intrain ~ "train",
+    datetime %within% inval ~ "validation"
+  )) 
+
+head(scotty_log)
+```
+
+```{r}
+scotty_log %<>%
+  group_by(src_sub_area, set) %>% 
+   nest(.key = "data") %>% 
+   pivot_wider(names_from = set, values_from = data)
+
+scotty_log
+```
+
+# 6.Modelling
+
+First, a list containing the time series function is needed to be constructed.
+'ts' function is designated for time series models with single seasonality, in this case daily, therefore the frequency is 24 for 24 hours. 
+'msts' fuction is designated for time series models with multiple seasonality, in this case daily and weekly, therefore there is an additional frequency of 24 * 7 for 24 hours in 7 days. 
+```{r}
+data_funs <- list(
+  ts = function(x) ts(x$demand, frequency = 24),
+  msts = function(x) msts(x$demand, seasonal.periods = c(24, 24 * 7))
+)
+
+data_funs
+```
+
+Second, the rows are duplicated for each area 'src_sub_area' using 'rep()' function. Then, the list is transformed into dataframe by using 'enframe'.
+Afterward the area 'src_sub_area' is inserted into the table. This is crucial to be able to join 'data_funs' and 'scotty'  based on the area.
+```{r}
+data_funs %<>%
+  rep(length(unique(scotty$src_sub_area)))%>%
+  enframe("data_fun_name", "data_fun") %>%
+  mutate(src_sub_area =
+    sort(rep(unique(scotty$src_sub_area), length(unique(.$data_fun_name)))))
+
+data_funs
+```
+
+Third, join 'data_fun' and 'scotty_sqrtscale', as well as 'scotty_log'
+```{r}
+scotty_sqrtscale %<>%
+  left_join(data_funs)
+
+scotty_log %<>%
+  left_join(data_funs)
+```
+
+```{r}
+scotty_sqrtscale
+```
+
+```{r}
+scotty_log
+```
+
+Fourth, a list of the time series models, for this project
+```{r}
+models <- list(
+  auto.arima = function(x) auto.arima(x),
+  ets = function(x) ets(x),
+  stlm = function(x) stlm(x),
+  tbats = function(x) tbats(x, use.box.cox = FALSE),
+  holt.winter = function(x) HoltWinters(x,seasonal = "additive")
+)
+
+models
+```
+
+Fifth, similar to the 'data_funs' list. The rows of 'models' are duplicated for each area 'src_sub_area' using 'rep()' function. Then, the list is transformed into dataframe by using 'enframe'.
+Afterward the area 'src_sub_area' is inserted into the table. This is crucial to be able to join 'models' and 'scotty_sqrtscale', as well as 'scotty_log'  based on the area.
+```{r}
+models %<>%
+  rep(length(unique(scotty$src_sub_area))) %>%
+  enframe("model_name", "model") %>%
+  mutate(src_sub_area =
+    sort(rep(unique(scotty$src_sub_area), length(unique(.$model_name))))
+  )
+
+models
+```
+
+Sixth, 'models' and 'scotty_sqrtscale', as well as 'scotty_log' are joint. However, auto.arima and ets are not suitable for a multiple seasonality time series modeling. Therefore, 'filter' function is used to make sure the models are not included into the time series forecasing for multiple seasonality. 
+```{r}
+scotty_sqrtscale %<>%
+  left_join(models) %>%
+  filter(
+    !(model_name == "ets" & data_fun_name == "msts"),
+    !(model_name == "auto.arima" & data_fun_name == "msts")
+  )
+
+scotty_log %<>%
+  left_join(models) %>%
+  filter(
+    !(model_name == "ets" & data_fun_name == "msts"),
+    !(model_name == "auto.arima" & data_fun_name == "msts")
+  )
+```
+
+```{r}
+scotty_sqrtscale
+```
+
+```{r}
+scotty_log
+```
+
+Seventh, to do the model fitting, we create a list ('param') of the train dataset using map(). Then, the time series object is created and saved in 'data' and then, it is moved to 'params'. Afterwards, the model is created by invoking the function in 'model' using the data in 'params'
+```{r}
+scotty_sqrtscale %<>%
+  mutate(
+    params = map(train, ~ list(x = .x)),
+    data = invoke_map(data_fun, params),
+    params = map(data, ~ list(x = .x)), 
+    fitted = invoke_map(model, params)) %>%
+  select(-data, -params)
+
+scotty_sqrtscale
+```
+
+```{r}
+scotty_log %<>%
+  mutate(
+    params = map(train, ~ list(x = .x)),
+    data = invoke_map(data_fun, params),
+    params = map(data, ~ list(x = .x)), 
+    fitted = invoke_map(model, params)) %>%
+  select(-data, -params)
+
+scotty_log
+```
+
+Eight, the error from the models for both preprocessed data are calculated, in this case we are calculating and comparing the MAE (Mean absolute error) 
+
+```{r}
+scotty_sqrtscale %<>%
+  mutate(error =
+    map(fitted, ~ forecast(.x, h = 24 * 15)) %>%
+    map2_dbl(validation, ~ mae_vec(truth = rec_revert_sqrtscale(.y$demand,rec,src_sub_area), estimate = rec_revert_sqrtscale(.x$mean,rec,src_sub_area)))) %>%
+  arrange(src_sub_area, error)
+
+scotty_sqrtscale
+```
+
+```{r}
+scotty_log %<>%
+  mutate(error =
+    map(fitted, ~ forecast(.x, h = 24 * 15)) %>%
+    map2_dbl(validation, ~ mae_vec(truth = exp(.y$demand), estimate = exp(.x$mean)))) %>%
+  arrange(src_sub_area, error)
+
+scotty_log
+```
+
+Lastly, we chose the three best models from both transformed data for every area 'src_sub_area'. 
+
+For square root transformed data: 
+```{r}
+scotty_sqrtscale %<>%
+  select(-fitted) %>% # remove unused
+  group_by(src_sub_area) %>%
+  filter(error == min(error)) %>%
+  ungroup()
+
+scotty_sqrtscale
+```
+
+For log transformed data: 
+```{r}
+scotty_log %<>%
+  select(-fitted) %>% # remove unused
+  group_by(src_sub_area) %>%
+  filter(error == min(error)) %>%
+  ungroup()
+
+scotty_log
+```
+We will used the square root transformed data, with above mentioned models, Because by using those methods, it shows the overall lowest MAE, compared using the log transformed data.
+
+# 7. Forecasting using Test Dataset
+
+Now we will forecast the data for the dataset: which is 7 days additional of the latest day in the validation date. 
+
+Because the model we made was using the train data, therefore for this case we will forecast using the train data only. 
+
+
+```{r}
+scotty_sqrtscale %<>%
+  mutate(
+    params = map(train, ~ list(x = .x)), # fulll data
+    data = invoke_map(data_fun, params),
+    params = map(data, ~ list(x = .x)),
+    fitted = invoke_map(model, params)
+  ) %>%
+  select(-data, -params)
+
+scotty_sqrtscale
+```
+
+
+
+We will forecast for 22 days because we are using the train dataset only (15 days is the length of the validationd dataset, 7 days is the lenght of the test dataset).
+```{r}
+scotty_sqrtscale %<>%
+  mutate(forecast =
+    map(fitted, ~ forecast(.x, h = 24 * 22)) %>%
+    map2(train, ~ tibble(
+      datetime = timetk::tk_make_future_timeseries(.y$datetime, 24 * 22), demand = as.vector(.x$mean)
+    ))
+  )
+
+scotty_sqrtscale
+```
+
+```{r}
+scotty_sqrtscale_analysis <- scotty_sqrtscale
+```
+
+Then, we unnest the value.
+```{r}
+scotty_sqrtscale %<>%
+  select(src_sub_area, actual = train, forecast) %>%
+  gather(key, value, -src_sub_area) %>%
+  unnest(value) %>%
+  mutate(demand = rec_revert_sqrtscale(demand, rec, src_sub_area))
+  
+head(scotty_sqrtscale)
+```
+
+Afterwards, we create the forecasted data
+```{r}
+scotty_sqrtscale_forecast <- scotty_sqrtscale %>%
+  filter(key == "forecast") %>% 
+   select(-key)
+
+head(scotty_sqrtscale_forecast)
+```
+
+We take the data only for the latest 7 days.
+
+```{r}
+# train-val-test size
+test_size <- 24 * 7 # 15 from 62 days 
+
+# get the min-max of the time index for each sample
+test_end <- max(scotty_sqrtscale_forecast$datetime)
+test_start <- test_end - hours(test_size) + hours(1)
+
+intest <- interval(test_start, test_end)
+
+intest
+```
+
+```{r}
+scotty_sqrtscale_forecast %<>%
+  mutate(sample = case_when(
+    datetime %within% intest ~ "test"
+  ))
+
+head(scotty_sqrtscale_forecast)
+```
+
+```{r}
+scotty_sqrtscale_forecast %<>%
+  filter(sample == "test") 
+
+head(scotty_sqrtscale_forecast)
+```
+
+
+Finally, the data is inserted into test dataset.
+```{r}
+scotty_test <- read.csv("data/data-test.csv")
+
+head(scotty_test)
+```
+
+```{r}
+scotty_test$datetime <- ymd_hms(scotty_test$datetime)
+
+head(scotty_test)
+```
+
+```{r}
+scotty_test$demand = scotty_sqrtscale_forecast$demand
+```
+
+```{r}
+head(scotty_test)
+```
+
+```{r}
+write.csv(scotty_test,"data/data-test.csv")
+```
+
+# 8. Conclusion
+
+By inserting the data-test.csv to Algoritma Leaderboard Score site, I received, below errors for data input on 29 & 31 of March 2020: 
+1. MAE for sxk97 area is 7.26 by using tbats method
+2. MAE for sxk9e area is 8.47 by using stlm method
+3. MAE for sxk9s area is 7.39 by using tbats method
+
+And overall MAE is 7.71. This is for the data transformed using square root transformation. 
+
+These are the best models for this project is:
+1.for sxk97 area is 7.26 by using tbats method
+2.for sxk9e area is 8.47 by using stlm method
+3. for sxk9s area is 7.39 by using tbats method.
+And combined with square root preprocessing.
+
+
+
